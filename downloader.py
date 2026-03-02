@@ -1,24 +1,27 @@
 import os
+import re
+import json
+import uuid
 import asyncio
 import aiohttp
-import re
-import uuid
-import json
 
 DOWNLOAD_DIR = "downloads"
 CHUNK_SIZE = 4 * 1024 * 1024
-VIDEO_EXTENSIONS = (".mp4", ".mkv", ".m3u8")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "*/*",
+    "Connection": "keep-alive"
 }
+
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-# =============================
-# ORDENAÇÃO NATURAL
-# =============================
+# =========================================================
+# ORDENAÇÃO NATURAL (Ep 1, Ep 2, Ep 10)
+# =========================================================
 
 def natural_sort_key(s):
     return [
@@ -27,9 +30,9 @@ def natural_sort_key(s):
     ]
 
 
-# =============================
-# DOWNLOAD DIRETO
-# =============================
+# =========================================================
+# DOWNLOAD DIRETO (anti HTML / anti bloqueio)
+# =========================================================
 
 async def download_direct(url, progress_callback=None):
 
@@ -41,7 +44,23 @@ async def download_direct(url, progress_callback=None):
             if resp.status != 200:
                 raise Exception(f"Erro HTTP {resp.status}")
 
-            filename = os.path.basename(url.split("?")[0])
+            content_type = resp.headers.get("Content-Type", "").lower()
+
+            # 🚨 bloqueia HTML
+            if "text/html" in content_type:
+                raise Exception("Servidor retornou HTML.")
+
+            filename = None
+
+            # tenta pegar nome do header
+            cd = resp.headers.get("Content-Disposition")
+            if cd:
+                match = re.search('filename="?(.+?)"?$', cd)
+                if match:
+                    filename = match.group(1)
+
+            if not filename:
+                filename = os.path.basename(url.split("?")[0])
 
             if not filename or "." not in filename:
                 filename = str(uuid.uuid4()) + ".mp4"
@@ -63,12 +82,17 @@ async def download_direct(url, progress_callback=None):
                             last_percent = percent
                             await progress_callback(percent)
 
+    # 🚨 evita arquivo falso pequeno
+    if os.path.getsize(output_path) < 500_000:
+        os.remove(output_path)
+        raise Exception("Arquivo inválido ou bloqueado.")
+
     return output_path
 
 
-# =============================
+# =========================================================
 # DOWNLOAD M3U8
-# =============================
+# =========================================================
 
 async def download_m3u8(url):
 
@@ -93,41 +117,70 @@ async def download_m3u8(url):
     return output_path
 
 
-# =============================
-# PROCESS LINK UNIVERSAL
-# =============================
+# =========================================================
+# DETECTA LINKS DE PASTA (index)
+# =========================================================
+
+async def detect_folder_links(url):
+
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as session:
+        async with session.get(url) as resp:
+
+            if resp.status != 200:
+                return None
+
+            text = await resp.text()
+
+            links = re.findall(r'href="([^"]+)"', text)
+
+            video_links = []
+
+            for link in links:
+                if any(ext in link.lower() for ext in VIDEO_EXTENSIONS):
+                    if not link.startswith("http"):
+                        link = url.rstrip("/") + "/" + link.lstrip("/")
+                    video_links.append(link)
+
+            if video_links:
+                video_links.sort(key=natural_sort_key)
+                return video_links
+
+    return None
+
+
+# =========================================================
+# PROCESSADOR UNIVERSAL
+# =========================================================
 
 async def process_link(url, progress_callback=None):
 
-    # ======================================
-    # 1️⃣ TENTA DOWNLOAD DIRETO PRIMEIRO
-    # ======================================
+    # 1️⃣ tenta detectar pasta primeiro
+    folder_links = await detect_folder_links(url)
+    if folder_links:
 
+        results = []
+
+        for link in folder_links:
+            result = await process_link(link, progress_callback)
+            results.append(result)
+
+        return results
+
+    # 2️⃣ se for m3u8
+    if ".m3u8" in url.lower():
+        return await download_m3u8(url)
+
+    # 3️⃣ tenta download direto
     try:
         return await download_direct(url, progress_callback)
     except Exception:
         pass
 
-
-    # ======================================
-    # 2️⃣ SE FOR M3U8
-    # ======================================
-
-    if ".m3u8" in url.lower():
-        return await download_m3u8(url)
-
-
-    # ======================================
-    # 3️⃣ TENTA LISTAR COMO PLAYLIST
-    # ======================================
-
+    # 4️⃣ tenta playlist via yt-dlp
     try:
-        cmd = [
-            "yt-dlp",
-            "-J",
-            "--flat-playlist",
-            url
-        ]
+        cmd = ["yt-dlp", "-J", "--flat-playlist", url]
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -135,15 +188,13 @@ async def process_link(url, progress_callback=None):
             stderr=asyncio.subprocess.PIPE
         )
 
-        stdout, stderr = await process.communicate()
+        stdout, _ = await process.communicate()
 
         if process.returncode == 0 and stdout:
-
             data = json.loads(stdout.decode())
             entries = data.get("entries")
 
             if entries:
-
                 video_urls = []
 
                 for entry in entries:
@@ -152,10 +203,9 @@ async def process_link(url, progress_callback=None):
                         video_urls.append(entry_url)
 
                 if video_urls:
-
                     video_urls.sort(key=natural_sort_key)
-                    results = []
 
+                    results = []
                     for video_url in video_urls:
                         result = await process_link(video_url, progress_callback)
                         results.append(result)
@@ -165,84 +215,7 @@ async def process_link(url, progress_callback=None):
     except Exception:
         pass
 
-
-    # ======================================
-    # 4️⃣ FALLBACK YT-DLP NORMAL
-    # ======================================
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-o", os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
-        url
-    ]
-
-    process = await asyncio.create_subprocess_exec(*cmd)
-    await process.wait()
-
-    if process.returncode != 0:
-        raise Exception("Erro ao baixar com yt-dlp.")
-
-    files = sorted(
-        [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
-        key=os.path.getctime
-    )
-
-    return files[-1]
-
-    
-    # =============================
-    # TENTA LISTAR COM YT-DLP
-    # =============================
-
-    try:
-        cmd = [
-            "yt-dlp",
-            "-J",
-            "--flat-playlist",
-            url
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await process.communicate()
-
-        if process.returncode == 0 and stdout:
-
-            data = json.loads(stdout.decode())
-            entries = data.get("entries")
-
-            if entries:
-
-                video_urls = []
-
-                for entry in entries:
-                    entry_url = entry.get("url")
-                    if entry_url:
-                        video_urls.append(entry_url)
-
-                if video_urls:
-
-                    video_urls.sort(key=natural_sort_key)
-                    results = []
-
-                    for video_url in video_urls:
-                        result = await process_link(video_url, progress_callback)
-                        results.append(result)
-
-                    return results
-
-    except Exception:
-        pass
-
-    # =============================
-    # FALLBACK YT-DLP NORMAL
-    # =============================
-
+    # 5️⃣ fallback yt-dlp normal
     cmd = [
         "yt-dlp",
         "--no-playlist",
