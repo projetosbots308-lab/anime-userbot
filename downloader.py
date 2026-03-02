@@ -99,15 +99,98 @@ async def download_m3u8(url):
 
 async def process_link(url, progress_callback=None):
 
-    url_lower = url.lower()
+    # ======================================
+    # 1️⃣ TENTA DOWNLOAD DIRETO PRIMEIRO
+    # ======================================
 
-    # EXTENSÃO DIRETA
-    if url_lower.endswith(".m3u8"):
+    try:
+        return await download_direct(url, progress_callback)
+    except Exception:
+        pass
+
+
+    # ======================================
+    # 2️⃣ SE FOR M3U8
+    # ======================================
+
+    if ".m3u8" in url.lower():
         return await download_m3u8(url)
 
-    if url_lower.endswith((".mp4", ".mkv")):
-        return await download_direct(url, progress_callback)
 
+    # ======================================
+    # 3️⃣ TENTA LISTAR COMO PLAYLIST
+    # ======================================
+
+    try:
+        cmd = [
+            "yt-dlp",
+            "-J",
+            "--flat-playlist",
+            url
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode == 0 and stdout:
+
+            data = json.loads(stdout.decode())
+            entries = data.get("entries")
+
+            if entries:
+
+                video_urls = []
+
+                for entry in entries:
+                    entry_url = entry.get("url")
+                    if entry_url:
+                        video_urls.append(entry_url)
+
+                if video_urls:
+
+                    video_urls.sort(key=natural_sort_key)
+                    results = []
+
+                    for video_url in video_urls:
+                        result = await process_link(video_url, progress_callback)
+                        results.append(result)
+
+                    return results
+
+    except Exception:
+        pass
+
+
+    # ======================================
+    # 4️⃣ FALLBACK YT-DLP NORMAL
+    # ======================================
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-o", os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        url
+    ]
+
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.wait()
+
+    if process.returncode != 0:
+        raise Exception("Erro ao baixar com yt-dlp.")
+
+    files = sorted(
+        [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
+        key=os.path.getctime
+    )
+
+    return files[-1]
+
+    
     # =============================
     # TENTA LISTAR COM YT-DLP
     # =============================
