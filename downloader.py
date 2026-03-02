@@ -236,5 +236,4 @@ except:
     pass  
 
 # FALLBACK  
-return await download_with_ytdlp(url)
-
+return await dowloader.py tual do nada come-on a dar erro com links drive
