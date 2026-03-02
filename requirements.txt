@@ -1,6 +1,6 @@
 python-telegram-bot==20.7
-pyrogram
-tgcrypto
-aiohttp
-aiofiles
-yt-dlp
+pyrogram==2.0.106
+tgcrypto==1.2.5
+aiohttp==3.9.5
+aiofiles==23.2.1
+yt-dlp>=2024.03.10
